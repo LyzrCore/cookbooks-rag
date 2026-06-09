@@ -221,10 +221,16 @@ def _time_agent_run(
     kb,
     question: str,
     oneshot: bool,
+    use_persistent: bool = False,
 ) -> tuple[Optional[float], float, str, list[dict], Optional[dict], Optional[str]]:
     """One scored agent.run call. Streams so TTFT is real.
 
     Returns (ttft_s, total_s, response_text, tool_calls, plan, error).
+
+    When `use_persistent=True`, the call assumes the agent already has the
+    correct feature config baked in (created by `setup_dev_bench_agents.py`)
+    and does NOT inject `knowledge_bases=` or `oneshot=True` per-call —
+    those would duplicate the persistent feature on the server.
     """
     t0 = time.perf_counter()
     first_token_t: Optional[float] = None
@@ -235,24 +241,31 @@ def _time_agent_run(
     err: Optional[str] = None
 
     try:
-        # Use with_config to pass planner hints (filter_fields, examples).
-        # Plain `kb` ignores them; oneshot's KB catalog uses them for routing.
-        kb_arg = kb.with_config(
-            filter_fields=["source"],
-            examples=[
-                "documents required for a commercial wire transfer",
-                "wire transfer approval workflow",
-                "wire request from Bath Planet of Chicago",
-                "manual wire transfer agreement",
-            ],
-        ) if oneshot else kb
-        kwargs = dict(
-            message=question,
-            knowledge_bases=[kb_arg],
-            stream=True,
-        )
-        if oneshot:
-            kwargs["oneshot"] = True
+        if use_persistent:
+            # Persistent agent already has the right KB feature (agentic_rag or
+            # oneshot_rag) in its stored config. Pass NO knowledge_bases= and
+            # NO oneshot= flag; the server-side dispatch reads the persisted
+            # feature and behaves accordingly.
+            kwargs = dict(message=question, stream=True)
+        else:
+            # Ephemeral runtime path — inject feature payload per call. Keeps
+            # `with_config` planner hints so oneshot's KB catalog has context.
+            kb_arg = kb.with_config(
+                filter_fields=["source"],
+                examples=[
+                    "documents required for a commercial wire transfer",
+                    "wire transfer approval workflow",
+                    "wire request from Bath Planet of Chicago",
+                    "manual wire transfer agreement",
+                ],
+            ) if oneshot else kb
+            kwargs = dict(
+                message=question,
+                knowledge_bases=[kb_arg],
+                stream=True,
+            )
+            if oneshot:
+                kwargs["oneshot"] = True
 
         for chunk in agent.run(**kwargs):
             if first_token_t is None and chunk.content:
@@ -472,6 +485,26 @@ def main() -> int:
         default=None,
         help="Cap the query set to the first N (smoke testing). Default: run all queries.",
     )
+    ap.add_argument(
+        "--fixture",
+        default=None,
+        help=(
+            "Path to a fixture JSON produced by setup_dev_bench_agents.py. "
+            "When set, benchmark uses the persistent agents named in the fixture "
+            "(skips fixture-building) and omits per-call knowledge_bases= so "
+            "the persistent feature config drives retrieval."
+        ),
+    )
+    ap.add_argument(
+        "--probe-once",
+        action="store_true",
+        help=(
+            "Before the streaming bench, run each query ONCE with stream=False, "
+            "oneshot=True to capture response.plan (the planner's structured "
+            "output) for diagnosis. Adds ~3-6s per query. Plans are written to "
+            "the results JSON under 'probe_plans'."
+        ),
+    )
     args = ap.parse_args()
 
     queries = DEFAULT_QUERIES[: args.limit] if args.limit else DEFAULT_QUERIES
@@ -488,7 +521,23 @@ def main() -> int:
     print(f"[setup] agent_base_url={agent_base_url}")
 
     # Fixture setup
-    if args.existing_agent_id and args.existing_kb_id:
+    fixture_data: Optional[dict] = None
+    use_persistent = False
+    agent_pair: Optional[tuple] = None  # (agentic_agent, oneshot_agent) when persistent
+    if args.fixture:
+        with open(args.fixture) as f:
+            fixture_data = json.load(f)
+        kb_id = fixture_data["kb_id"]
+        agentic_id = fixture_data["agentic_agent_id"]
+        oneshot_id = fixture_data["oneshot_agent_id"]
+        print(f"[fixture] Using persistent agents from {args.fixture}")
+        print(f"   kb={kb_id}  agentic={agentic_id}  oneshot={oneshot_id}")
+        agentic_agent = studio.get_agent(agentic_id)
+        oneshot_agent = studio.get_agent(oneshot_id)
+        kb = studio.get_knowledge_base(kb_id)
+        agent_pair = (agentic_agent, oneshot_agent)
+        use_persistent = True
+    elif args.existing_agent_id and args.existing_kb_id:
         print(f"[fixture] Using existing agent={args.existing_agent_id} kb={args.existing_kb_id}")
         agent = studio.get_agent(args.existing_agent_id)
         kb = studio.get_knowledge_base(args.existing_kb_id)
@@ -502,6 +551,30 @@ def main() -> int:
             print(f"   - {os.path.basename(p)}")
         agent, kb = build_fixture(studio, pdfs, args.parser, agent_base_url, api_key)
 
+    # Optional probe: capture response.plan via a single non-streaming run per query.
+    probe_plans: dict[str, dict] = {}
+    if args.probe_once:
+        probe_agent = agent_pair[1] if use_persistent else agent  # type: ignore[index]
+        print(f"\n[probe] capturing planner output for {len(queries)} queries (stream=False, oneshot=True)")
+        for q in queries:
+            try:
+                kwargs = dict(message=q.question, stream=False)
+                if not use_persistent:
+                    kwargs["knowledge_bases"] = [kb]
+                    kwargs["oneshot"] = True
+                resp = probe_agent.run(**kwargs)
+                p = getattr(resp, "plan", None)
+                probe_plans[q.question] = p if isinstance(p, dict) else {}
+                summary = "no plan"
+                if isinstance(p, dict):
+                    nr = p.get("needs_retrieval")
+                    sqs = p.get("sub_queries") or []
+                    summary = f"needs_retrieval={nr} sub_queries={len(sqs)}"
+                print(f"   [{q.category}] {q.question[:60]!r:<62} {summary}")
+            except Exception as exc:
+                probe_plans[q.question] = {"_error": f"{type(exc).__name__}: {exc}"}
+                print(f"   [probe-err] {q.question[:60]!r}: {exc}")
+
     # Run benchmark
     results: list[RunResult] = []
     print(f"\n[bench] {len(queries)} queries × 2 paths × {args.runs} runs = "
@@ -510,8 +583,16 @@ def main() -> int:
         print(f"\n[bench] ({q_idx}/{len(queries)}) [{q.category}] {q.question}")
         for run_idx in range(args.runs):
             for oneshot, path in [(False, "agentic_rag"), (True, "oneshot_rag")]:
+                # Pick the right agent: persistent pair if fixture, else the
+                # shared ephemeral agent (which gets per-call feature injection).
+                if use_persistent and agent_pair is not None:
+                    target_agent = agent_pair[0] if not oneshot else agent_pair[1]
+                else:
+                    target_agent = agent  # noqa: F821
                 ttft, total, text, tcs, plan, err = _time_agent_run(
-                    agent, kb, q.question, oneshot=oneshot,
+                    target_agent, kb, q.question,
+                    oneshot=oneshot,
+                    use_persistent=use_persistent,
                 )
                 results.append(RunResult(
                     category=q.category,
@@ -531,13 +612,23 @@ def main() -> int:
 
     # Persist
     out_path = args.out
+    if use_persistent and agent_pair is not None:
+        agentic_id_out = agent_pair[0].id
+        oneshot_id_out = agent_pair[1].id
+    else:
+        agentic_id_out = getattr(agent, "id", None)  # noqa: F821
+        oneshot_id_out = None
     with open(out_path, "w") as f:
         json.dump({
             "queries": [asdict(q) for q in queries],
             "runs": args.runs,
             "parser": args.parser,
-            "agent_id": getattr(agent, "id", None),
+            "fixture": args.fixture,
+            "use_persistent": use_persistent,
+            "agentic_agent_id": agentic_id_out,
+            "oneshot_agent_id": oneshot_id_out,
             "kb_id": getattr(kb, "id", None),
+            "probe_plans": probe_plans,
             "results": [asdict(r) for r in results],
         }, f, indent=2, default=str)
     print(f"\n[bench] Raw results written to {out_path}")
