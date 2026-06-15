@@ -114,13 +114,38 @@ class QResult:
     agentic_routed_kbs: list = field(default_factory=list)  # inferred from cited filenames
 
 
+_TRANSIENT = ("503", "502", "504", "service temporarily", "timeout", "timed out",
+              "temporarily unavailable", "connection", "rate limit", "429")
+
+
+def _is_transient(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(t in s for t in _TRANSIENT)
+
+
+def _retry(fn, tries: int = 5, base: float = 4.0):
+    """Call fn(); retry on transient errors (503/502/504/timeout/conn) with
+    exponential backoff. Re-raises the last non-transient error or after tries."""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not _is_transient(exc) or i == tries - 1:
+                raise
+            time.sleep(base * (2 ** i))  # 4, 8, 16, 32s
+    if last:
+        raise last
+
+
 def stream_run(agent, message: str):
-    """Return (ttft, total, text, error). Persistent agent, no per-call KBs."""
-    t0 = time.perf_counter()
-    first = None
-    deltas, final = [], ""
-    err = None
-    try:
+    """Return (ttft, total, text, error). Persistent agent, no per-call KBs.
+    Retries the whole stream on a transient error *before any token* arrived."""
+    def attempt():
+        t0 = time.perf_counter()
+        first = None
+        deltas, final = [], ""
         for chunk in agent.run(message=message, stream=True):
             if first is None and chunk.content:
                 first = time.perf_counter()
@@ -128,12 +153,21 @@ def stream_run(agent, message: str):
                 final = chunk.content or ""
             else:
                 deltas.append(chunk.content or "")
+        total = time.perf_counter() - t0
+        ttft = (first - t0) if first else None
+        # The SDK emits incremental deltas then a final done=True chunk with the
+        # FULL accumulated text. On some paths the deltas arrive truncated while
+        # the final chunk is complete — so use whichever is longer as the
+        # authoritative answer text. (TTFT still comes from the first delta.)
+        joined = "".join(deltas)
+        text = final if len(final) >= len(joined) else joined
+        return ttft, total, text
+
+    try:
+        ttft, total, text = _retry(attempt)
+        return ttft, total, text, None
     except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
-    total = time.perf_counter() - t0
-    ttft = (first - t0) if first else None
-    text = "".join(deltas) if deltas else final
-    return ttft, total, text, err
+        return None, 0.0, "", f"{type(exc).__name__}: {exc}"
 
 
 def probe_routing(agent, message: str):
@@ -145,7 +179,7 @@ def probe_routing(agent, message: str):
     Returns (retrieved_any: bool|None, routed_kb_names: list[str], n_docs, error).
     """
     try:
-        resp = agent.run(message=message, stream=False)
+        resp = _retry(lambda: agent.run(message=message, stream=False))
         rr = getattr(resp, "raw_response", None) or {}
         mo = rr.get("module_outputs") if isinstance(rr, dict) else None
         mo = mo or {}
@@ -187,6 +221,8 @@ def main() -> int:
                          "Ensures every KB is exercised once per path for the side-by-side.")
     ap.add_argument("--no-bench", action="store_true", help="Routing probe only; skip streaming latency pass.")
     ap.add_argument("--no-probe", action="store_true", help="Latency only; skip routing probe.")
+    ap.add_argument("--throttle", type=float, default=1.5,
+                    help="Seconds to sleep between queries (avoid overloading dev -> 503s). Default 1.5.")
     args = ap.parse_args()
 
     api_key = os.environ.get("LYZR_API_KEY")
@@ -252,7 +288,10 @@ def main() -> int:
         exp = ",".join(ab(e) for e in r.expected) or "—"
         plan = ",".join(ab(p) for p in r.planned_kbs) or "—"
         hit = "✓" if (set(r.expected) & set(r.planned_kbs)) else ("·" if not r.expected else "✗")
-        print(f"  ({i}/{len(queries)}) [{q.category:<11}] {hit} n={r.n_docs:<2} exp=[{exp}] plan=[{plan}]", flush=True)
+        errflag = " ERR" if r.plan_error else ""
+        print(f"  ({i}/{len(queries)}) [{q.category:<11}] {hit} n={r.n_docs:<2} exp=[{exp}] plan=[{plan}]{errflag}", flush=True)
+        if args.throttle:
+            time.sleep(args.throttle)
 
     json.dump(
         {"fixture": args.fixture, "n": len(results),
